@@ -1,3 +1,4 @@
+use std::ops::Deref;
 use std::process::Command;
 use std::path::Path;
 use std::io::SeekFrom;
@@ -7,7 +8,6 @@ use std::fs::File;
 use std::io;
 use std::io::Seek;
 use std::io::Read;
-use std::io::Write;
 use std::io::Result;
 use lz4::Decoder;
 use clap::Parser;
@@ -19,15 +19,9 @@ struct Args {
     /// Input file or directory
     input: String,
 
+    /// Output directory
     #[arg(short = 'x', long)]
-    extract: bool,
-
-    #[arg(short, long)]
-    decrypt: bool,
-
-    /// Output file or directory
-    #[arg(short, long)]
-    output: String,
+    extract: Option<String>,
 }
 
 struct Entry {
@@ -38,10 +32,8 @@ struct Entry {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    if args.decrypt {
-        decypher(&args.input, &args.output)?;
-    } else if args.extract {
-        extract(&args.input, &args.output)?;
+    if let Some(output) = args.extract {
+        extract(&args.input, &output)?;
     }
 
     Ok(())
@@ -49,9 +41,20 @@ fn main() -> Result<()> {
 
 fn extract(input_file: &str, dir: &str) -> Result<()> {
     let mut f = File::open(&input_file).unwrap();
+    let first_byte = f.read_u8()?;
+    f.seek(SeekFrom::Start(0))?;
+
+    let mut f = match first_byte {
+        0x00 => XorReader::transparent(f),
+        0x46 => XorReader::new(f),
+        _ => panic!("Invalid byte detected."),
+    };
+
+    f.seek(SeekFrom::Start(0))?;
     let start = f.read_u32::<BigEndian>()? as u64;
 
     if start > f.metadata()?.len() {
+        println!("{:#X} / {:#X}", start, f.metadata()?.len());
         panic!("CORRUPTED FILE: {}", input_file);
     }
 
@@ -111,6 +114,73 @@ fn extract(input_file: &str, dir: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn unlz4(source: &str, destination: &str) -> Result<()> {
+    let input_file = File::open(source)?;
+    let mut decoder = Decoder::new(input_file)?;
+    let mut output_file = File::create(destination)?;
+    io::copy(&mut decoder, &mut output_file)?;
+
+    Ok(())
+}
+
+struct XorReader<T: Read + Seek> {
+    key: [u8; 0x1b2580],
+    reader: T,
+}
+
+impl<T: Read + Seek> XorReader<T> {
+    pub fn new(reader: T) -> Self {
+        let mut key = [0u8; 0x1b2580];
+        let mut uvar4 = 0usize;
+        while uvar4 < 0x1b2580 {
+            let bvar6 = DAT_00B6CD20[uvar4 % 0x7b];
+            let bvar3 = DAT_00B6CCA0[uvar4 % 0x71];
+            let bvar4 = DAT_00B6CC20[uvar4 & 0x7f];
+            key[uvar4] = bvar6 ^ bvar3 ^ bvar4;
+
+            uvar4 += 1;
+        }
+
+        Self {
+            key,
+            reader,
+        }
+    }
+
+    pub fn transparent(reader: T) -> Self {
+        Self {
+            key: [0u8; 0x1b2580],
+            reader,
+        }
+    }
+}
+
+impl<T: std::io::Read + std::io::Seek> std::io::Read for XorReader<T> {
+    fn read(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
+        let pos = self.stream_position()?;
+        let size = self.reader.read(data)?;
+
+        for i in 0..size {
+            data[i] ^= self.key[(pos as usize + i) % self.key.len()];
+        }
+
+        Ok(size)
+    }
+}
+
+impl<T: std::io::Read + std::io::Seek> std::ops::Deref for XorReader<T> {
+    type Target = T;
+    fn deref(&self) -> &<Self as Deref>::Target {
+        &self.reader
+    }
+}
+
+impl<T: std::io::Read + std::io::Seek> std::ops::DerefMut for XorReader<T> {
+    fn deref_mut(&mut self) -> &mut <Self as Deref>::Target {
+        &mut self.reader
+    }
 }
 
 const DAT_00B6CCA0: [u8; 128] = [
@@ -217,43 +287,3 @@ const DAT_00B6CD20: [u8; 128] = [
 0x4C, 0x63, 0x6C, 0x7E,
 0x9B, 0xF4, 0x8C, 0x72
 ];
-
-fn decypher(input_file: &str, output_file: &str) -> Result<()> {
-    let mut f = File::open(&input_file).unwrap();
-
-    let mut dat_13749bf: Vec<u8> = Vec::with_capacity(0x1b2580);
-
-    let mut uvar4 = 0usize;
-
-    while uvar4 < 0x1b2580 {
-        let bvar6 = DAT_00B6CD20[uvar4 % 0x7b];
-        let bvar3 = DAT_00B6CCA0[uvar4 % 0x71];
-        let bvar4 = DAT_00B6CC20[uvar4 & 0x7f];
-        dat_13749bf.push(bvar6 ^ bvar3 ^ bvar4);
-
-        uvar4 += 1;
-    }
-
-    let len = f.metadata().unwrap().len() as usize;
-    let mut index = 0;
-    let mut bytes = Vec::with_capacity(len);
-    f.read_to_end(&mut bytes)?;
-    for i in 0..len {
-        bytes[i] ^= dat_13749bf[index];
-        index = (index + 1) % dat_13749bf.len();
-    }
-    let mut out = File::create(&output_file).unwrap();
-    out.write(&bytes)?;
-
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn unlz4(source: &str, destination: &str) -> Result<()> {
-    let input_file = File::open(source)?;
-    let mut decoder = Decoder::new(input_file)?;
-    let mut output_file = File::create(destination)?;
-    io::copy(&mut decoder, &mut output_file)?;
-
-    Ok(())
-}
